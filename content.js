@@ -5,9 +5,12 @@
 // Behaviour is fully generic (no per-site rules): before capturing, the
 // script waits until the rendered page settles (load complete, DOM quiet,
 // visible text length stable). Generic bot-verification interstitials
-// ("Just a moment", "Verify you are human", ...) are not captured; the
-// script keeps watching until real content replaces them, up to a
-// timeout, and flags the capture if it never clears.
+// ("Just a moment", "Verify you are human", ...) are NEVER captured;
+// the script keeps watching until real content replaces them, and gives
+// up without saving if they do not clear within INTERSTITIAL_WAIT_MS.
+// Duplicate saves of the same URL within DEDUPE_MS are suppressed
+// (a reload with the fragment still attached must not re-fire); the
+// toolbar button bypasses the suppression for an explicit re-capture.
 // Output: POSTs a bundle {markdown, article_markdown, meta, html} to the
 // local collector at http://127.0.0.1:8765/save. If the collector is not
 // reachable, falls back to downloading the Markdown file.
@@ -15,7 +18,10 @@
   "use strict";
 
   var COLLECTOR = "http://127.0.0.1:8765/save";
+  var INTERSTITIAL_WAIT_MS = 120000; // max time to wait out a bot check
+  var DEDUPE_MS = 30000;             // suppress repeat saves of one URL
   var started = false;
+  var capturedKey = "";              // URL (no fragment) saved in this document
 
   // ---------- generic page helpers ----------
 
@@ -83,32 +89,51 @@
   // Matches page *type*, never a specific site.
   function looksInterstitial() {
     var title = document.title || "";
-    if (/just a moment|security verification|attention required|checking your browser|are you human/i.test(title)) return true;
+    if (/just a moment|security verification|attention required|checking your browser|are you human|しばらくお待ちください|人間であることを確認/i.test(title)) return true;
+    // Challenge-platform scaffolding present in the DOM (the interstitial
+    // page itself, not an embedded captcha widget on a real page).
+    if (document.querySelector(
+      "#challenge-form, #challenge-running, #cf-challenge-running, " +
+      'iframe[src*="challenges.cloudflare.com"], ' +
+      'script[src*="challenge-platform"]')) return true;
     var text = document.body ? document.body.innerText : "";
     if (text.length < 1500 &&
-        /verify you are human|security verification|verifies you are not a bot|checking your browser/i.test(text)) return true;
+        /verify you are human|security verification|verifies you are not a bot|checking your browser|あなたが人間であることを確認|ロボットではないことを確認/i.test(text)) return true;
     return false;
   }
 
   // Wait until the page settles: load complete + DOM quiet for 1.2s +
   // visible text length stable across two samples. Hard cap maxMs.
+  // `done` fires exactly once: the safety timeout is cancelled when the
+  // settle check wins (previously both paths fired, saving the page
+  // twice ~maxMs apart).
   function whenSettled(done, maxMs) {
     var deadline = Date.now() + (maxMs || 12000);
     var lastLen = -1;
     var stableCount = 0;
     var timer = null;
+    var finished = false;
     var observer = new MutationObserver(function () { schedule(); });
+    function finish() {
+      if (finished) return;
+      finished = true;
+      if (timer) clearTimeout(timer);
+      clearTimeout(safety);
+      observer.disconnect();
+      done();
+    }
     function schedule() {
+      if (finished) return;
       if (timer) clearTimeout(timer);
       timer = setTimeout(check, 1200);
     }
     function check() {
+      if (finished) return;
       var len = visibleTextLength();
       if (len === lastLen) { stableCount++; } else { stableCount = 0; lastLen = len; }
       var settled = document.readyState === "complete" && stableCount >= 1;
       if (settled || Date.now() > deadline) {
-        observer.disconnect();
-        done();
+        finish();
       } else {
         schedule();
       }
@@ -116,7 +141,7 @@
     if (document.readyState === "complete") { schedule(); }
     else { window.addEventListener("load", schedule, { once: true }); setTimeout(schedule, 3000); }
     observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
-    setTimeout(function () { observer.disconnect(); done(); }, (maxMs || 12000) + 2000);
+    var safety = setTimeout(finish, (maxMs || 12000) + 2000);
   }
 
   function collectMeta(extra) {
@@ -204,8 +229,25 @@
 
   // ---------- capture ----------
 
-  function doCapture(withScroll, flags) {
+  function doCapture(withScroll, flags, force) {
     var run = function () {
+      // Final guards, checked at save time (not when the wait started):
+      // never save a bot-verification page, and never save the same URL
+      // twice in quick succession (reload with the fragment attached,
+      // double-fired triggers). The toolbar button passes force=true.
+      if (looksInterstitial()) return;
+      var key = location.href.split("#")[0];
+      if (!force) {
+        if (capturedKey === key) return;
+        try {
+          var last = JSON.parse(sessionStorage.getItem("mdcapture:last") || "null");
+          if (last && last.url === key && Date.now() - last.at < DEDUPE_MS) return;
+        } catch (e) { /* sessionStorage unavailable: in-document guard still applies */ }
+      }
+      capturedKey = key;
+      try {
+        sessionStorage.setItem("mdcapture:last", JSON.stringify({ url: key, at: Date.now() }));
+      } catch (e) {}
       try {
         var html = "<!DOCTYPE html>\n" + document.documentElement.outerHTML;
         var meta = collectMeta(flags);
@@ -237,6 +279,7 @@
           meta: meta,
           html: html
         };
+
         fetch(COLLECTOR, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -258,16 +301,18 @@
     if (withScroll) scrollThroughPage(run); else run();
   }
 
-  function start(withScroll) {
+  function start(withScroll, force) {
     if (started) return;
     started = true;
     var beginAt = Date.now();
     (function attempt() {
       if (looksInterstitial()) {
-        // Verification page: wait for real content (same-document swap)
-        // or for a navigation (new document re-triggers automatically).
-        if (Date.now() - beginAt > 25000) {
-          whenSettled(function () { doCapture(withScroll, { possible_interstitial: true }); }, 4000);
+        // Verification page: save nothing. Keep re-checking until real
+        // content replaces it (same-document swap), a navigation loads
+        // a new document (which re-triggers automatically), or the wait
+        // budget runs out -- in which case give up without saving.
+        if (Date.now() - beginAt > INTERSTITIAL_WAIT_MS) {
+          badge("Bot verification did not clear; nothing captured", false);
           return;
         }
         setTimeout(attempt, 1000);
@@ -275,18 +320,18 @@
       }
       whenSettled(function () {
         if (looksInterstitial()) { setTimeout(attempt, 1000); return; }
-        doCapture(withScroll, { settle_ms: Date.now() - beginAt });
+        doCapture(withScroll, { settle_ms: Date.now() - beginAt }, force);
       }, 12000);
     })();
   }
 
   if (location.hash.indexOf("mdcapture") !== -1) {
-    setTimeout(function () { start(location.hash.indexOf("scroll") !== -1); }, 300);
+    setTimeout(function () { start(location.hash.indexOf("scroll") !== -1, false); }, 300);
   }
   chrome.runtime.onMessage.addListener(function (msg) {
     if (msg && msg.type === "mdcapture") {
       started = false;
-      start(false);
+      start(false, true);
     }
   });
 })();
